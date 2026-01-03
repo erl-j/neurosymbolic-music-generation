@@ -1,10 +1,27 @@
 # Neurosymbolic Music Generation
 
+[![great work](https://img.shields.io/badge/great-work-gold)](https://github.com/erl-j/neurosymbolic-music-generation)
+[![YouTube](https://img.shields.io/badge/YouTube-demo-red?logo=youtube)](https://www.youtube.com/watch?v=vkNX7z25aWg)
+[![tests](https://img.shields.io/badge/tests-0%20failing-brightgreen)](https://github.com/erl-j/neurosymbolic-music-generation)
+[![BibTeX](https://img.shields.io/badge/cite-BibTeX-blue)](#cite)
+
+LLMs are musical assistants. Coding large language models cooks every domain specific symbolic music generation model out there.
+Why train a bespoke neural network on MIDI files when LLMS already understands rhythm, harmony, and structure through code? 
+To demonstrate this, this repository contains a  browserbased system for music composition. 
+Clone this repo, load it into an LLM-augmented code editor, and start jamming.
+
 [![Demo Video](https://img.youtube.com/vi/vkNX7z25aWg/maxresdefault.jpg)](https://www.youtube.com/watch?v=vkNX7z25aWg)
 
-Browser-based system for AI-assisted music composition. LLMs write JavaScript that generates notes in real-time.
+*Click to watch demo on YouTube*
 
-Clone this repo, load it into an LLM-augmented code editor, and start jamming.
+## In This Repository
+
+| File | Description |
+|------|-------------|
+| `livecoding.html` | The browser-based music environment. Open this. |
+| `music.js` | Your composition. The server hot-reloads this on save. |
+| `server.js` | Optional. Enables hot-reload and sample loading. |
+| `pieces/` | Example compositions to learn from or remix. |
 
 ## Why JavaScript
 
@@ -97,15 +114,6 @@ return (t, s) => {
 };
 ```
 
-## Features
-
-- Hot reload on file save
-- Piano roll visualization
-- BPM and volume controls
-- MIDI output support
-- Sample search with boolean operators
-- Per-note exclusive IDs (retrigger/cut behavior)
-
 ## Inspirations
 
 - [DreamCoder](https://arxiv.org/abs/2006.08381) - Kevin Ellis et al. Program synthesis through wake-sleep library learning.
@@ -116,10 +124,10 @@ return (t, s) => {
 ## Cite
 
 ```bibtex
-@software{livecoding-js,
+@software{neurosymbolic-music-generation,
   author = {Jonason, Nicolas},
   title = {Neurosymbolic Music Generation},
-  url = {https://github.com/nicolasjonason/livecoding-js}
+  url = {https://github.com/erl-j/neurosymbolic-music-generation}
 }
 ```
 
