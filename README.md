@@ -1,10 +1,16 @@
 # Neurosymbolic Music Generation
 
-Browser-based system for AI-assisted music composition. LLMs write JavaScript that generates notes in real-time.
-
 "Neurosymbolic" in this case is a fancy way of saying: have an LLM write code that represents music. The neural part is the language model. The symbolic part is JavaScript.
 
+*"Just clone this repo and load it into some llm augmented code editor and you will have the time of your life." Ä
+
 [Demo video](https://www.youtube.com/watch?v=vkNX7z25aWg)
+
+Browser-based system for AI-assisted music composition. LLMs write JavaScript that generates notes in real-time.
+
+
+
+
 
 ## Why JavaScript for Music Generation
 
