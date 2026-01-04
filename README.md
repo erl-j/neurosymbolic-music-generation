@@ -18,7 +18,7 @@ Clone this repo, load it into an LLM-augmented code editor (I like cursor & clau
 
 | File | Description |
 |------|-------------|
-| `livecoding.html` | The browser-based music environment. Open this. |
+| `livecoding.html` | The browser-based music environment. Open this in a browser. |
 | `music.js` | Your composition. The server hot-reloads this on save. |
 | `server.js` | Optional. Enables hot-reload and sample loading. |
 | `pieces/` | Example compositions to learn from or remix. |
