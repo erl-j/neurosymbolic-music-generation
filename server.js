@@ -41,7 +41,39 @@ function scanSamplesDir() {
 
 function searchSamples(query) {
     const q = query.toLowerCase();
-    return sampleCache.filter(s => s.name.toLowerCase().includes(q));
+    return sampleCache.filter(s =>
+        s.name.toLowerCase().includes(q) ||
+        s.relativePath.toLowerCase().includes(q)
+    );
+}
+
+// Parse slider annotations from code
+function parseSliders(code) {
+    const sliderRegex = /\/\/\s*@slider\s+(\w+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/g;
+    const sliders = [];
+    let match;
+    while ((match = sliderRegex.exec(code)) !== null) {
+        sliders.push({
+            name: match[1],
+            value: parseFloat(match[2]),
+            min: parseFloat(match[3]),
+            max: parseFloat(match[4])
+        });
+    }
+    return sliders;
+}
+
+// Update slider value in code
+function updateSliderValue(code, sliderName, newValue) {
+    // Update the annotation comment
+    const sliderRegex = new RegExp(`(\/\/\\s*@slider\\s+${sliderName}\\s+)[\\d.]+`, 'g');
+    let updatedCode = code.replace(sliderRegex, `$1${newValue}`);
+
+    // Update the variable assignment (if it exists)
+    const varRegex = new RegExp(`(\\s+${sliderName}\\s*=\\s*)[\\d.]+`, 'g');
+    updatedCode = updatedCode.replace(varRegex, `$1${newValue}`);
+
+    return updatedCode;
 }
 
 // Ensure file exists
@@ -59,10 +91,52 @@ return notes;
 const server = http.createServer((req, res) => {
     // Enable CORS for localhost access
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
     const url = new URL(req.url, `http://localhost:${PORT}`);
 
-    if (url.pathname === '/events') {
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+
+    if (url.pathname === '/log-error' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', () => {
+            try {
+                const { message, stack, url: errorUrl, line, col } = JSON.parse(body);
+                console.error('CLIENT ERROR:');
+                console.error(`  Message: ${message}`);
+                if (errorUrl) console.error(`  URL: ${errorUrl}`);
+                if (line) console.error(`  Line: ${line}, Column: ${col}`);
+                if (stack) console.error(`  Stack:\n${stack}`);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+    } else if (url.pathname === '/update-slider' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', () => {
+            try {
+                const { name, value } = JSON.parse(body);
+                const code = fs.readFileSync(FILE_TO_WATCH, 'utf8');
+                const updatedCode = updateSliderValue(code, name, value);
+                fs.writeFileSync(FILE_TO_WATCH, updatedCode, 'utf8');
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true }));
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: e.message }));
+            }
+        });
+    } else if (url.pathname === '/events') {
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache',
@@ -72,7 +146,8 @@ const server = http.createServer((req, res) => {
         const sendUpdate = () => {
             fs.readFile(FILE_TO_WATCH, 'utf8', (err, data) => {
                 if (!err) {
-                    res.write(`data: ${JSON.stringify({ code: data })}\n\n`);
+                    const sliders = parseSliders(data);
+                    res.write(`data: ${JSON.stringify({ code: data, sliders })}\n\n`);
                 }
             });
         };

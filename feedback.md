@@ -443,3 +443,12 @@ else { /* sparse elements only */ }
 8. **Reverb for depth**: Use `r` parameter for far/near placement
 9. **Motivic development**: Take a short idea (motif) and transform it
 10. **Listen to references**: Study grooves and progressions from real tracks
+
+---
+
+## FEEDBACK LOG
+
+### 2026-01-06: Slider float handling
+- Changed sliders to handle float values instead of just integers
+- Updated HTML slider step to be dynamic: 0.1 for ranges > 10, 0.01 for smaller ranges
+- Display shows 2 decimal places for floats, no decimals for integers

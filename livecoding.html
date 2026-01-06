@@ -9,6 +9,7 @@
     <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://unpkg.com/tone"></script>
 
     <style>
         * {
@@ -68,20 +69,426 @@
         const { useState, useEffect, useRef, useCallback } = React;
         const apiKey = "";
 
+        // Log errors to server
+        const logErrorToServer = (message, stack, url, line, col) => {
+            fetch('http://localhost:8080/log-error', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message, stack, url, line, col })
+            }).catch(() => { });
+        };
+
+        // Global error handler
+        window.onerror = (message, url, line, col, error) => {
+            logErrorToServer(message, error?.stack, url, line, col);
+            return false;
+        };
+
+        // Unhandled promise rejection handler
+        window.addEventListener('unhandledrejection', (event) => {
+            logErrorToServer(
+                event.reason?.message || String(event.reason),
+                event.reason?.stack,
+                window.location.href,
+                null,
+                null
+            );
+        });
+
+        // --- TONE.JS EFFECT WRAPPERS ---
+        // Tone.js effects use native Web Audio nodes (no worklets required)
+
+        // --- EFFECT MANAGER ---
+        class EffectManager {
+            constructor(masterGain) {
+                this.masterGain = masterGain;
+                this.ctx = masterGain.context;
+                this.effects = new Map(); // name -> { node, inputGain, type, lifetime, ticksRemaining, sends }
+                this.pendingSends = []; // { sourceNode, effectName, amount } - for deferred connections
+                this.defaultLifetime = 64; // ticks of inactivity before removal
+                this.bpm = 120; // default BPM for tick-to-second conversion
+            }
+
+            setBpm(bpm) {
+                this.bpm = bpm;
+            }
+
+            ticksToSeconds(ticks) {
+                // 1 tick = (60 / bpm) / 4 seconds
+                return ticks * (60.0 / this.bpm) / 4.0;
+            }
+
+            createEffect(type, params = {}) {
+                // Factory for Tone.js effects (uses native Web Audio nodes, no worklets)
+                // Clamp values to valid ranges
+                const clamp01 = (val) => Math.max(0, Math.min(1, val));
+
+                switch (type) {
+                    case 'reverb':
+                        // Tone.Reverb uses ConvolverNode (native)
+                        // decay is in ticks, convert to seconds for roomSize calculation
+                        const decaySeconds = params.decay !== undefined ? this.ticksToSeconds(params.decay) : 2.0;
+                        const reverb = new Tone.Reverb({
+                            roomSize: Math.min(0.99, decaySeconds / 10),
+                            wet: clamp01(params.wet !== undefined ? params.wet : 0.5)
+                        });
+                        // Generate impulse response
+                        reverb.generate();
+                        return reverb;
+                    case 'delay':
+                        // Tone.FeedbackDelay uses DelayNode (native)
+                        // delayTime is in ticks, convert to seconds
+                        const delayTimeSeconds = params.delayTime !== undefined ? this.ticksToSeconds(params.delayTime) : this.ticksToSeconds(1);
+                        // Clamp feedback to [0, 1] - values > 1 cause feedback explosion
+                        return new Tone.FeedbackDelay({
+                            delayTime: delayTimeSeconds,
+                            feedback: clamp01(params.feedback !== undefined ? params.feedback : 0.5),
+                            wet: clamp01(params.wet !== undefined ? params.wet : 0.5)
+                        });
+                    case 'pingpong':
+                        // Tone.PingPongDelay alternates delayed signal between left and right channels
+                        // delayTime is in ticks, convert to seconds
+                        const pingpongDelayTimeSeconds = params.delayTime !== undefined ? this.ticksToSeconds(params.delayTime) : this.ticksToSeconds(1);
+                        return new Tone.PingPongDelay({
+                            delayTime: pingpongDelayTimeSeconds,
+                            feedback: clamp01(params.feedback !== undefined ? params.feedback : 0.5),
+                            wet: clamp01(params.wet !== undefined ? params.wet : 0.5)
+                        });
+                    case 'chorus':
+                        // Tone.Chorus uses DelayNode with LFO (native)
+                        return new Tone.Chorus({
+                            frequency: params.frequency || 2,
+                            delayTime: 0.01 + clamp01(params.depth || 0.5) * 0.01,
+                            depth: clamp01(params.depth || 0.5),
+                            wet: clamp01(params.wet !== undefined ? params.wet : 0.5)
+                        });
+                    case 'filter':
+                        // Tone.Filter uses BiquadFilterNode (native)
+                        return new Tone.Filter({
+                            frequency: params.frequency || 1000,
+                            type: params.filterType || params.type || 'lowpass',
+                            Q: params.Q || 1
+                        });
+                    case 'distortion':
+                        // Tone.Distortion uses WaveShaperNode (native)
+                        return new Tone.Distortion({
+                            distortion: clamp01(params.distortion !== undefined ? params.distortion : 0.4),
+                            wet: clamp01(params.wet !== undefined ? params.wet : 0.5)
+                        });
+                    default:
+                        console.warn(`Unknown effect type: ${type}`);
+                        return null;
+                }
+            }
+
+            updateEffect(name, params) {
+                const existing = this.effects.get(name);
+
+                if (existing) {
+                    // Update parameters on existing effect
+                    const node = existing.node;
+                    this.applyParams(node, existing.type, params);
+
+                    // Reset activity counter
+                    existing.ticksRemaining = params.life || existing.lifetime;
+                    existing.lifetime = params.life || existing.lifetime;
+
+                    // Update sends if provided
+                    if (params.sends) {
+                        existing.sends = params.sends;
+                        this.rewireEffectSends(name);
+                    }
+                } else if (params.type) {
+                    // Create new effect
+                    const node = this.createEffect(params.type, params);
+                    if (!node) return;
+
+                    // Create input gain for routing multiple sources
+                    // All Tone.js effects are ToneAudioNodes
+                    const inputGain = new Tone.Gain(1);
+                    inputGain.connect(node);
+
+                    const lifetime = params.life || this.defaultLifetime;
+                    const effectData = {
+                        node,
+                        inputGain,
+                        type: params.type,
+                        lifetime,
+                        ticksRemaining: lifetime,
+                        sends: params.sends || null,
+                        outputConnections: [] // Track outgoing connections
+                    };
+
+                    this.effects.set(name, effectData);
+
+                    // Connect to master or other effects based on sends
+                    if (params.sends) {
+                        this.rewireEffectSends(name);
+                    } else {
+                        // Connect Tone.js effect to master
+                        Tone.connect(node, this.masterGain);
+                    }
+
+
+                    // Process any pending sends waiting for this effect
+                    this.processPendingSends(name);
+                }
+            }
+
+            applyParams(node, type, params) {
+                // Update Tone.js effect parameters
+                // Clamp values to valid ranges
+                const clamp01 = (val) => Math.max(0, Math.min(1, val));
+
+                try {
+                    switch (type) {
+                        case 'reverb':
+                            // Tone.Reverb params
+                            // decay is in ticks, convert to seconds
+                            if (params.decay !== undefined && node.roomSize) {
+                                const decaySeconds = this.ticksToSeconds(params.decay);
+                                node.roomSize.value = Math.min(0.99, decaySeconds / 10);
+                                // Regenerate impulse response if decay changed significantly
+                                if (node.generate) node.generate();
+                            }
+                            if (params.wet !== undefined && node.wet) {
+                                node.wet.value = clamp01(params.wet);
+                            }
+                            break;
+                        case 'delay':
+                            // Tone.FeedbackDelay params
+                            // delayTime is in ticks, convert to seconds
+                            if (params.delayTime !== undefined && node.delayTime) {
+                                node.delayTime.value = this.ticksToSeconds(params.delayTime);
+                            }
+                            if (params.feedback !== undefined && node.feedback) {
+                                // Clamp feedback to [0, 1] to prevent feedback explosion
+                                node.feedback.value = clamp01(params.feedback);
+                            }
+                            if (params.wet !== undefined && node.wet) {
+                                node.wet.value = clamp01(params.wet);
+                            }
+                            break;
+                        case 'pingpong':
+                            // Tone.PingPongDelay params
+                            // delayTime is in ticks, convert to seconds
+                            if (params.delayTime !== undefined && node.delayTime) {
+                                node.delayTime.value = this.ticksToSeconds(params.delayTime);
+                            }
+                            if (params.feedback !== undefined && node.feedback) {
+                                // Clamp feedback to [0, 1] to prevent feedback explosion
+                                node.feedback.value = clamp01(params.feedback);
+                            }
+                            if (params.wet !== undefined && node.wet) {
+                                node.wet.value = clamp01(params.wet);
+                            }
+                            break;
+                        case 'chorus':
+                            // Tone.Chorus params
+                            if (params.frequency !== undefined && node.frequency) {
+                                node.frequency.value = params.frequency;
+                            }
+                            if (params.depth !== undefined) {
+                                const clampedDepth = clamp01(params.depth);
+                                if (node.depth) node.depth.value = clampedDepth;
+                                if (node.delayTime) node.delayTime.value = 0.01 + clampedDepth * 0.01;
+                            }
+                            if (params.wet !== undefined && node.wet) {
+                                node.wet.value = clamp01(params.wet);
+                            }
+                            break;
+                        case 'filter':
+                            // Tone.Filter params
+                            if (params.frequency !== undefined && node.frequency) {
+                                node.frequency.value = params.frequency;
+                            }
+                            if (params.Q !== undefined && node.Q) {
+                                node.Q.value = params.Q;
+                            }
+                            if ((params.filterType !== undefined || params.type !== undefined) && node.type !== undefined) {
+                                node.type = params.filterType || params.type;
+                            }
+                            break;
+                        case 'distortion':
+                            // Tone.Distortion params
+                            if (params.distortion !== undefined && node.distortion) {
+                                node.distortion.value = clamp01(params.distortion);
+                            }
+                            if (params.wet !== undefined && node.wet) {
+                                node.wet.value = clamp01(params.wet);
+                            }
+                            break;
+                    }
+                } catch (e) {
+                    console.warn('Error applying effect params:', e);
+                }
+            }
+
+            rewireEffectSends(name) {
+                const effectData = this.effects.get(name);
+                if (!effectData || !effectData.sends) return;
+
+                const node = effectData.node;
+
+                // Disconnect existing outputs
+                try {
+                    node.disconnect();
+                } catch (e) { }
+                effectData.outputConnections = [];
+
+                // Connect to target effects
+                let hasConnection = false;
+                for (const [targetName, amount] of Object.entries(effectData.sends)) {
+                    const target = this.effects.get(targetName);
+                    if (target) {
+                        // Create a Tone.Gain for the send amount
+                        const sendGain = new Tone.Gain(amount);
+
+                        // Connect Tone.js effect to send gain to target input
+                        Tone.connect(node, sendGain);
+                        sendGain.connect(target.inputGain);
+
+                        effectData.outputConnections.push({ target: targetName, gain: sendGain });
+                        hasConnection = true;
+                        // Mark target as active
+                        target.ticksRemaining = target.lifetime;
+                    }
+                }
+
+                // If no valid sends, connect to master
+                if (!hasConnection) {
+                    Tone.connect(node, this.masterGain);
+                }
+            }
+
+            routeToEffect(effectName, sourceNode, amount) {
+                const effectData = this.effects.get(effectName);
+
+                if (effectData) {
+                    try {
+                        // Create Tone.Gain for send amount
+                        const sendGain = new Tone.Gain(amount);
+
+                        // Connect Web Audio source -> Tone.Gain -> Tone effect input
+                        Tone.connect(sourceNode, sendGain);
+                        sendGain.connect(effectData.inputGain);
+
+                        // Reset activity counter
+                        effectData.ticksRemaining = effectData.lifetime;
+
+                        return sendGain;
+                    } catch (e) {
+                        console.warn(`Failed to route to effect ${effectName}:`, e);
+                        return null;
+                    }
+                } else {
+                    // Effect doesn't exist yet, queue for later
+                    this.pendingSends.push({ sourceNode, effectName, amount });
+                    return null;
+                }
+            }
+
+            processPendingSends(effectName) {
+                const remaining = [];
+                for (const pending of this.pendingSends) {
+                    if (pending.effectName === effectName) {
+                        this.routeToEffect(effectName, pending.sourceNode, pending.amount);
+                    } else {
+                        remaining.push(pending);
+                    }
+                }
+                this.pendingSends = remaining;
+            }
+
+            tick() {
+                // Called each tick to manage effect lifetimes
+                const toRemove = [];
+
+                for (const [name, effectData] of this.effects) {
+                    effectData.ticksRemaining--;
+
+                    if (effectData.ticksRemaining <= 0) {
+                        toRemove.push(name);
+                    }
+                }
+
+                // Remove inactive effects
+                for (const name of toRemove) {
+                    this.removeEffect(name);
+                }
+            }
+
+            markActive(effectName) {
+                const effectData = this.effects.get(effectName);
+                if (effectData) {
+                    effectData.ticksRemaining = effectData.lifetime;
+                }
+            }
+
+            removeEffect(name) {
+                const effectData = this.effects.get(name);
+                if (effectData) {
+                    try {
+                        // Disconnect and dispose Tone.js node
+                        effectData.node.disconnect();
+                        effectData.node.dispose();
+
+                        // Disconnect and dispose input gain
+                        effectData.inputGain.disconnect();
+                        effectData.inputGain.dispose();
+
+                        // Clean up output connections
+                        for (const conn of effectData.outputConnections) {
+                            try {
+                                conn.gain.disconnect();
+                                conn.gain.dispose();
+                            } catch (e) { }
+                        }
+                    } catch (e) { }
+                    this.effects.delete(name);
+                    console.log(`Effect removed: ${name}`);
+                }
+            }
+
+            clear() {
+                for (const name of this.effects.keys()) {
+                    this.removeEffect(name);
+                }
+                this.pendingSends = [];
+            }
+
+            getEffect(name) {
+                return this.effects.get(name);
+            }
+
+            hasEffect(name) {
+                return this.effects.has(name);
+            }
+        }
+
         // --- AUDIO ENGINE ---
         class AudioEngine {
             constructor() {
                 this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+                // Sync Tone.js context with our AudioContext
+                Tone.setContext(this.ctx);
+
                 this.masterGain = this.ctx.createGain();
                 this.masterGain.gain.value = 0.3;
                 this.masterGain.connect(this.ctx.destination);
 
+                // Legacy reverb for backwards compatibility (r parameter)
                 this.reverbNode = this.ctx.createConvolver();
                 this.reverbNode.buffer = this.createReverbBuffer(2.0);
                 this.reverbGain = this.ctx.createGain();
                 this.reverbGain.gain.value = 0.4;
                 this.reverbNode.connect(this.reverbGain);
                 this.reverbGain.connect(this.masterGain);
+
+                // Effect manager for send system
+                this.effectManager = new EffectManager(this.masterGain);
+                this.bpm = 120; // default BPM
 
                 this.noiseBuffer = this.createNoiseBuffer();
                 this.midiAccess = null;
@@ -361,6 +768,11 @@
                 this.masterGain.gain.setTargetAtTime(val, this.ctx.currentTime, 0.1);
             }
 
+            setBpm(bpm) {
+                this.bpm = bpm;
+                this.effectManager.setBpm(bpm);
+            }
+
             createNoiseBuffer() {
                 const bufferSize = this.ctx.sampleRate * 2;
                 const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
@@ -391,7 +803,7 @@
                 return 440 * Math.pow(2, (m - 69) / 12);
             }
 
-            triggerKick(time, vol, pan, reverbAmount) {
+            triggerKick(time, vol, pan, reverbAmount, sends = null) {
                 const osc = this.ctx.createOscillator();
                 const gain = this.ctx.createGain();
                 const panner = this.ctx.createStereoPanner();
@@ -400,16 +812,25 @@
                 osc.connect(gain); gain.connect(panner); panner.connect(this.masterGain);
                 panner.connect(revSend); revSend.connect(this.reverbNode);
 
+                // Effect sends
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan; revSend.gain.value = reverbAmount;
                 osc.frequency.setValueAtTime(150, time);
                 osc.frequency.exponentialRampToValueAtTime(0.01, time + 0.5);
                 gain.gain.setValueAtTime(vol, time);
                 gain.gain.exponentialRampToValueAtTime(0.01, time + 0.5);
                 osc.start(time); osc.stop(time + 0.5);
-                osc.onended = () => { try { gain.disconnect(); panner.disconnect(); revSend.disconnect(); } catch (e) { } };
+                osc.onended = () => { try { gain.disconnect(); panner.disconnect(); revSend.disconnect(); sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } }); } catch (e) { } };
             }
 
-            triggerSnare(time, vol, pan, reverbAmount) {
+            triggerSnare(time, vol, pan, reverbAmount, sends = null) {
                 const noise = this.ctx.createBufferSource(); noise.buffer = this.noiseBuffer;
                 const noiseFilter = this.ctx.createBiquadFilter(); noiseFilter.type = 'highpass'; noiseFilter.frequency.value = 1000;
                 const noiseGain = this.ctx.createGain();
@@ -422,16 +843,25 @@
                 noiseGain.connect(panner); oscGain.connect(panner);
                 panner.connect(this.masterGain); panner.connect(revSend); revSend.connect(this.reverbNode);
 
+                // Effect sends
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan; revSend.gain.value = reverbAmount;
                 noiseGain.gain.setValueAtTime(vol, time); noiseGain.gain.exponentialRampToValueAtTime(0.01, time + 0.2);
                 osc.frequency.setValueAtTime(100, time); oscGain.gain.setValueAtTime(vol * 0.5, time); oscGain.gain.exponentialRampToValueAtTime(0.01, time + 0.1);
 
                 noise.start(time); osc.start(time);
                 noise.stop(time + 0.2); osc.stop(time + 0.2);
-                osc.onended = () => { try { panner.disconnect(); revSend.disconnect(); noiseGain.disconnect(); oscGain.disconnect(); } catch (e) { } };
+                osc.onended = () => { try { panner.disconnect(); revSend.disconnect(); noiseGain.disconnect(); oscGain.disconnect(); sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } }); } catch (e) { } };
             }
 
-            triggerHiHat(time, vol, pan, reverbAmount, open = false) {
+            triggerHiHat(time, vol, pan, reverbAmount, open = false, sends = null) {
                 const source = this.ctx.createBufferSource(); source.buffer = this.noiseBuffer;
                 const filter = this.ctx.createBiquadFilter(); filter.type = 'highpass'; filter.frequency.value = 7000;
                 const gain = this.ctx.createGain();
@@ -440,14 +870,23 @@
                 source.connect(filter); filter.connect(gain); gain.connect(panner);
                 panner.connect(this.masterGain); panner.connect(revSend); revSend.connect(this.reverbNode);
 
+                // Effect sends
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan; revSend.gain.value = reverbAmount;
                 const duration = open ? 0.3 : 0.05;
                 gain.gain.setValueAtTime(vol * 0.8, time); gain.gain.exponentialRampToValueAtTime(0.01, time + duration);
                 source.start(time); source.stop(time + duration + 0.05);
-                source.onended = () => { try { panner.disconnect(); gain.disconnect(); revSend.disconnect(); } catch (e) { } };
+                source.onended = () => { try { panner.disconnect(); gain.disconnect(); revSend.disconnect(); sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } }); } catch (e) { } };
             }
 
-            triggerClap(time, vol, pan, reverbAmount) {
+            triggerClap(time, vol, pan, reverbAmount, sends = null) {
                 const source = this.ctx.createBufferSource(); source.buffer = this.noiseBuffer;
                 const filter = this.ctx.createBiquadFilter(); filter.type = 'bandpass'; filter.frequency.value = 1500; filter.Q.value = 1;
                 const gain = this.ctx.createGain();
@@ -456,6 +895,15 @@
                 source.connect(filter); filter.connect(gain); gain.connect(panner);
                 panner.connect(this.masterGain); panner.connect(revSend); revSend.connect(this.reverbNode);
 
+                // Effect sends
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan; revSend.gain.value = reverbAmount;
                 const t = time;
                 gain.gain.setValueAtTime(0, t); gain.gain.linearRampToValueAtTime(vol, t + 0.01);
@@ -463,19 +911,29 @@
                 gain.gain.exponentialRampToValueAtTime(0.1, t + 0.04); gain.gain.linearRampToValueAtTime(vol, t + 0.05);
                 gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
                 source.start(time); source.stop(time + 0.25);
-                source.onended = () => { try { panner.disconnect(); gain.disconnect(); revSend.disconnect(); } catch (e) { } };
+                source.onended = () => { try { panner.disconnect(); gain.disconnect(); revSend.disconnect(); sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } }); } catch (e) { } };
             }
 
-            triggerTom(time, vol, pan, reverbAmount, pitch = 100) {
+            triggerTom(time, vol, pan, reverbAmount, pitch = 100, sends = null) {
                 const osc = this.ctx.createOscillator(); const gain = this.ctx.createGain();
                 const panner = this.ctx.createStereoPanner(); const revSend = this.ctx.createGain();
                 osc.connect(gain); gain.connect(panner); panner.connect(this.masterGain);
                 panner.connect(revSend); revSend.connect(this.reverbNode);
+
+                // Effect sends
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan; revSend.gain.value = reverbAmount;
                 osc.frequency.setValueAtTime(pitch, time); osc.frequency.exponentialRampToValueAtTime(pitch * 0.5, time + 0.2);
                 gain.gain.setValueAtTime(vol, time); gain.gain.exponentialRampToValueAtTime(0.001, time + 0.2);
                 osc.start(time); osc.stop(time + 0.25);
-                osc.onended = () => { try { panner.disconnect(); gain.disconnect(); revSend.disconnect(); } catch (e) { } };
+                osc.onended = () => { try { panner.disconnect(); gain.disconnect(); revSend.disconnect(); sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } }); } catch (e) { } };
             }
 
             triggerMidi(channel, pitch, vol, duration, audioTime, noteId) {
@@ -514,6 +972,7 @@
                 const vol = options.vol !== undefined ? options.vol : 0.5;
                 const pan = options.pan !== undefined ? options.pan : 0;
                 const reverbAmount = options.reverb !== undefined ? options.reverb : 0.0;
+                const sends = options.sends || null;
                 const noteId = options.id;
                 let wave = options.wave || 'sine';
 
@@ -541,16 +1000,16 @@
                 }
 
                 if (wave === 'drums') {
-                    if (midi === 36 || midi === 35) this.triggerKick(time, vol, pan, reverbAmount);
-                    else if (midi === 38 || midi === 40) this.triggerSnare(time, vol, pan, reverbAmount);
-                    else if (midi === 39) this.triggerClap(time, vol, pan, reverbAmount);
-                    else if (midi === 42 || midi === 44) this.triggerHiHat(time, vol, pan, reverbAmount, false);
-                    else if (midi === 46) this.triggerHiHat(time, vol, pan, reverbAmount, true);
+                    if (midi === 36 || midi === 35) this.triggerKick(time, vol, pan, reverbAmount, sends);
+                    else if (midi === 38 || midi === 40) this.triggerSnare(time, vol, pan, reverbAmount, sends);
+                    else if (midi === 39) this.triggerClap(time, vol, pan, reverbAmount, sends);
+                    else if (midi === 42 || midi === 44) this.triggerHiHat(time, vol, pan, reverbAmount, false, sends);
+                    else if (midi === 46) this.triggerHiHat(time, vol, pan, reverbAmount, true, sends);
                     else if (midi === 41 || midi === 43 || midi === 45 || midi === 47 || midi === 48 || midi === 50) {
                         let pitch = 80; if (midi > 43) pitch = 110; if (midi > 47) pitch = 140;
-                        this.triggerTom(time, vol, pan, reverbAmount, pitch);
+                        this.triggerTom(time, vol, pan, reverbAmount, pitch, sends);
                     }
-                    else this.triggerTom(time, vol, pan, reverbAmount, 300);
+                    else this.triggerTom(time, vol, pan, reverbAmount, 300, sends);
                     return;
                 }
 
@@ -561,7 +1020,8 @@
                     const key = `${query}:${index}`;
                     const cached = this.sampleCache[key];
                     if (cached && cached.buffer) {
-                        this.playSampleWithId(cached.buffer, time, vol, pan, reverbAmount, midi, noteId, durationSeconds, options.start);
+                        const attack = options.attack !== undefined ? options.attack : 0.01;
+                        this.playSampleWithId(cached.buffer, time, vol, pan, reverbAmount, midi, noteId, durationSeconds, options.start, sends, attack);
                     } else if (!cached || !cached.loading) {
                         this.loadSample(query, index);
                     }
@@ -586,8 +1046,22 @@
                 if (fmIndex > 0) { modulator.connect(modGain); modGain.connect(osc.frequency); }
                 osc.connect(filter); filter.connect(gain); gain.connect(panner);
                 panner.connect(this.masterGain);
-                const revSend = this.ctx.createGain(); revSend.gain.value = Math.max(0, Math.min(1, reverbAmount));
-                panner.connect(revSend); revSend.connect(this.reverbNode);
+
+                // Legacy reverb (r parameter) - backwards compatible
+                const revSend = this.ctx.createGain();
+                revSend.gain.value = Math.max(0, Math.min(1, reverbAmount));
+                panner.connect(revSend);
+                revSend.connect(this.reverbNode);
+
+                // New send system
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan;
                 gain.gain.setValueAtTime(0, time);
                 gain.gain.linearRampToValueAtTime(vol, time + Math.max(0.001, attack));
@@ -602,14 +1076,19 @@
                 }
 
                 osc.onended = () => {
-                    try { gain.disconnect(); panner.disconnect(); revSend.disconnect(); } catch (e) { }
+                    try {
+                        gain.disconnect();
+                        panner.disconnect();
+                        revSend.disconnect();
+                        sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } });
+                    } catch (e) { }
                     if (noteId !== undefined && this.activeNotes[noteId]?.source === osc) {
                         delete this.activeNotes[noteId];
                     }
                 };
             }
 
-            playSampleWithId(buffer, time, vol, pan, reverbAmount, pitch, noteId, requestedDuration, startPos) {
+            playSampleWithId(buffer, time, vol, pan, reverbAmount, pitch, noteId, requestedDuration, startPos, sends = null, attack = 0.01) {
                 const source = this.ctx.createBufferSource();
                 source.buffer = buffer;
                 source.playbackRate.value = Math.pow(2, (pitch - 60) / 12);
@@ -623,20 +1102,31 @@
                 panner.connect(revSend);
                 revSend.connect(this.reverbNode);
 
+                // Effect sends
+                const sendGains = [];
+                if (sends) {
+                    for (const [effectName, amount] of Object.entries(sends)) {
+                        const sendGain = this.effectManager.routeToEffect(effectName, panner, amount);
+                        if (sendGain) sendGains.push(sendGain);
+                    }
+                }
+
                 panner.pan.value = pan;
                 revSend.gain.value = reverbAmount;
 
                 const offsetSeconds = (startPos || 0) * buffer.duration;
                 const remainingDuration = (buffer.duration - offsetSeconds) / source.playbackRate.value;
-                const fadeTime = 0.02;
+                const fadeTime = 0.1;
 
                 if (requestedDuration && requestedDuration < remainingDuration) {
-                    gain.gain.setValueAtTime(vol, time);
+                    gain.gain.setValueAtTime(0, time);
+                    gain.gain.linearRampToValueAtTime(vol, time + Math.max(0.001, attack));
                     gain.gain.setValueAtTime(vol, time + requestedDuration - fadeTime);
                     gain.gain.linearRampToValueAtTime(0, time + requestedDuration);
                     source.start(time, offsetSeconds, requestedDuration * source.playbackRate.value);
                 } else {
-                    gain.gain.value = vol;
+                    gain.gain.setValueAtTime(0, time);
+                    gain.gain.linearRampToValueAtTime(vol, time + Math.max(0.001, attack));
                     source.start(time, offsetSeconds);
                 }
 
@@ -645,11 +1135,27 @@
                 }
 
                 source.onended = () => {
-                    try { gain.disconnect(); panner.disconnect(); revSend.disconnect(); } catch (e) { }
+                    try { gain.disconnect(); panner.disconnect(); revSend.disconnect(); sendGains.forEach(sg => { try { sg.dispose(); } catch (e) { } }); } catch (e) { }
                     if (noteId !== undefined && this.activeNotes[noteId]?.source === source) {
                         delete this.activeNotes[noteId];
                     }
                 };
+            }
+
+            // Process effect events
+            processEffectEvent(event, bpm) {
+                if (event.effect) {
+                    // Update BPM if provided
+                    if (bpm !== undefined) {
+                        this.setBpm(bpm);
+                    }
+                    this.effectManager.updateEffect(event.effect, event);
+                }
+            }
+
+            // Call each tick to manage effect lifetimes
+            tickEffects() {
+                this.effectManager.tick();
             }
         }
 
@@ -883,6 +1389,7 @@ return (t, s) => {
             const [midiOutputs, setMidiOutputs] = useState([]);
             const [selectedMidiOutput, setSelectedMidiOutput] = useState(null);
             const [activeNotes, setActiveNotes] = useState([]);
+            const [sliders, setSliders] = useState([]);
 
             const engineRef = useRef(null);
             const userFuncRef = useRef(null);
@@ -918,6 +1425,9 @@ return (t, s) => {
                         try {
                             const data = JSON.parse(e.data);
                             setCode(data.code);
+                            if (data.sliders) {
+                                setSliders(data.sliders);
+                            }
                             setIsLiveLinked(true);
                         } catch (err) { console.error(err); }
                     };
@@ -943,7 +1453,7 @@ return (t, s) => {
                 engineRef.current.onNoteEvent = (note) => {
                     setActiveNotes(prev => {
                         const now = Date.now();
-                        const duration = (note.duration || 0.1) * 1000 + 100;
+                        const duration = (note.duration || 1.0) * 1000 + 100;
                         const newNote = { ...note, startTime: now, endTime: now + duration };
                         return [...prev.filter(n => n.endTime > now), newNote];
                     });
@@ -968,6 +1478,25 @@ return (t, s) => {
             }, []);
 
             useEffect(() => engineRef.current?.setVolume(volume), [volume]);
+            useEffect(() => engineRef.current?.setBpm(bpm), [bpm]);
+
+            const handleSliderChange = async (name, value) => {
+                // Optimistically update local state
+                setSliders(prev => prev.map(s =>
+                    s.name === name ? { ...s, value: parseFloat(value) } : s
+                ));
+
+                // Send update to server
+                try {
+                    await fetch('http://localhost:8080/update-slider', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ name, value: parseFloat(value) })
+                    });
+                } catch (e) {
+                    console.error('Failed to update slider:', e);
+                }
+            };
 
             useEffect(() => {
                 try {
@@ -977,23 +1506,59 @@ return (t, s) => {
                         userFuncRef.current = userFunc;
                         setError(null);
                     } else { throw new Error("Code must return a function."); }
-                } catch (e) { setError(e.message); }
+                } catch (e) {
+                    setError(e.message);
+                    logErrorToServer(e.message, e.stack, 'user code compilation', null, null);
+                }
             }, [code]);
 
             const scheduleNote = (tickNumber, time) => {
                 if (userFuncRef.current && engineRef.current) {
                     try {
-                        const notes = userFuncRef.current(tickNumber, time);
+                        const events = userFuncRef.current(tickNumber, time);
                         const secondsPerTick = (60.0 / bpm) / 4.0;
-                        if (Array.isArray(notes)) {
-                            notes.forEach(n => {
-                                const midi = n.p || 60; const dur = n.d || 0.1; const offsetTicks = n.o || 0;
+                        if (Array.isArray(events)) {
+                            // Separate effect events from note events
+                            const effectEvents = events.filter(e => e.effect);
+                            const noteEvents = events.filter(e => !e.effect);
+
+                            // Process effect events first (so effects exist before notes try to send to them)
+                            effectEvents.forEach(e => {
+                                engineRef.current.processEffectEvent(e, bpm);
+                            });
+
+                            // Process note events
+                            noteEvents.forEach(n => {
+                                const midi = n.p || 60;
+                                // All time parameters are in ticks, convert to seconds
+                                const durTicks = n.d !== undefined ? n.d : 1.0;
+                                const dur = durTicks * secondsPerTick;
+                                const offsetTicks = n.o || 0;
                                 const noteTime = time + (offsetTicks * secondsPerTick);
-                                const opts = { vol: n.v, attack: n.a, reverb: n.r, cutoff: n.c, wave: n.w || n.wave, fm: n.f || n.fm, ratio: n.ratio, pan: n.x, id: n.id, start: n.start };
+                                const opts = {
+                                    vol: n.v,
+                                    attack: n.a !== undefined ? n.a * secondsPerTick : undefined,
+                                    decay: n.decay !== undefined ? n.decay * secondsPerTick : undefined,
+                                    reverb: n.r,
+                                    cutoff: n.c,
+                                    wave: n.w || n.wave,
+                                    fm: n.f || n.fm,
+                                    ratio: n.ratio,
+                                    pan: n.x,
+                                    id: n.id,
+                                    start: n.start,
+                                    sends: n.sends  // New sends parameter
+                                };
                                 engineRef.current.playNote(midi, noteTime, dur, opts);
                             });
                         }
-                    } catch (e) { console.error(e); }
+
+                        // Tick effect manager to handle lifetimes
+                        engineRef.current.tickEffects();
+                    } catch (e) {
+                        console.error(e);
+                        logErrorToServer(e.message, e.stack, 'user code execution', null, null);
+                    }
                 }
             };
 
@@ -1016,13 +1581,18 @@ return (t, s) => {
                 };
             }, [isPlaying, scheduler]);
 
-            const togglePlay = () => {
+            const togglePlay = async () => {
                 if (isPlaying) {
                     workerRef.current?.postMessage('stop');
                     setIsPlaying(false);
                     setActiveNotes([]);
                 } else {
-                    if (engineRef.current.ctx.state === 'suspended') engineRef.current.ctx.resume();
+                    // Resume AudioContext first (required before Tone.start)
+                    if (engineRef.current.ctx.state === 'suspended') {
+                        await engineRef.current.ctx.resume();
+                    }
+                    // Start Tone.js (this also ensures AudioContext is running)
+                    await Tone.start();
                     tickCounterRef.current = 0;
                     nextNoteTimeRef.current = engineRef.current.ctx.currentTime + 0.05;
                     setIsPlaying(true);
@@ -1106,6 +1676,58 @@ return (t, s) => {
                             <span style={{ fontSize: '12px', color: '#999' }}>tick {currentTick}</span>
                         </div>
                     </div>
+
+                    {/* Centered Sliders */}
+                    {sliders.length > 0 && (
+                        <div style={{
+                            display: 'flex',
+                            justifyContent: 'center',
+                            alignItems: 'center',
+                            padding: '40px 20px',
+                            gap: '40px',
+                            flexWrap: 'wrap'
+                        }}>
+                            {sliders.map(slider => (
+                                <div key={slider.name} style={{
+                                    display: 'flex',
+                                    flexDirection: 'column',
+                                    gap: '8px',
+                                    width: '200px',
+                                    alignItems: 'center'
+                                }}>
+                                    <div style={{
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        fontSize: '14px',
+                                        color: '#1a1a1a',
+                                        width: '100%'
+                                    }}>
+                                        <span style={{ fontWeight: 'bold' }}>{slider.name}</span>
+                                        <span>{Number(slider.value) % 1 === 0 ? slider.value.toFixed(0) : slider.value.toFixed(2)}</span>
+                                    </div>
+                                    <input
+                                        type="range"
+                                        min={slider.min}
+                                        max={slider.max}
+                                        value={slider.value}
+                                        onChange={(e) => handleSliderChange(slider.name, e.target.value)}
+                                        step={(slider.max - slider.min) > 10 ? 0.1 : 0.01}
+                                        style={{ width: '100%' }}
+                                    />
+                                    <div style={{
+                                        display: 'flex',
+                                        justifyContent: 'space-between',
+                                        fontSize: '10px',
+                                        color: '#999',
+                                        width: '100%'
+                                    }}>
+                                        <span>{slider.min}</span>
+                                        <span>{slider.max}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
 
                     {/* Piano visualization */}
                     <PianoVisualization activeNotes={activeNotes} />

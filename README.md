@@ -87,20 +87,82 @@ Note properties:
 
 **MIDI output:** `m:channel` (e.g. `m:1` for channel 1)
 
+### Sliders (UI Controls)
+
+Add interactive sliders to control parameters in real-time using special comments:
+
+```js
+// @slider name default min max
+// @slider reverb 0.5 0 1
+// @slider speed 120 60 180
+// @slider cutoff 2000 200 5000
+
+return (t, s) => {
+    // Use slider values in your composition
+    n.push({ p: 60, v: reverb, c: cutoff });
+};
+```
+
+Sliders automatically appear in the UI. They support both integer and float values.
+
+### Effects & Sends
+
+Create effects and route notes through them using sends:
+
+**Define effects** (push them like notes with `life` parameter):
+
+```js
+// Reverb
+n.push({ effect: 'hall', type: 'reverb', decay: 3.0, wet: 0.8, life: 128 });
+
+// Delay
+n.push({ effect: 'echo', type: 'pingpong', delayTime: 0.5, feedback: 0.6, wet: 0.5, life: 128 });
+
+// Chorus
+n.push({ effect: 'chorus', type: 'chorus', frequency: 1.5, depth: 0.8, wet: 0.4, life: 128 });
+
+// Distortion
+n.push({ effect: 'drive', type: 'distortion', distortion: 0.3, wet: 0.5, life: 128 });
+```
+
+**Route notes to effects** using `sends`:
+
+```js
+n.push({
+    p: 60,
+    w: 'sawtooth',
+    sends: {
+        "hall": 0.7,      // 70% to reverb
+        "echo": 0.5,      // 50% to delay
+        "chorus": 0.3     // 30% to chorus
+    }
+});
+```
+
+The `life` parameter sets how many ticks the effect stays active (refresh each frame to keep it running).
+
 ### Example
 
 ```js
 return (t, s) => {
     const n = [];
     
+    // Add reverb effect
+    n.push({ effect: 'verb', type: 'reverb', decay: 2.0, wet: 0.6, life: 128 });
+    
     // kick on 1 and 3
     if (t % 8 === 0 || t % 8 === 6) {
         n.push({ p: 36, w: 'drums', v: 0.9 });
     }
     
-    // snare on 2 and 4
+    // snare on 2 and 4 with reverb
     if (t % 8 === 4) {
-        n.push({ p: 38, w: 'drums', v: 0.8 });
+        n.push({ 
+            p: 38, 
+            w: 'drums', 
+            v: 0.8,
+            sends: { "verb": 0.5 }
+        });
     }
     
     // hi-hat 16ths
