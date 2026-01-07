@@ -131,6 +131,7 @@ return (t, s) => {
 ```bibtex
 @software{vibejam,
   author = {Jonason, Nicolas},
+  date = {January 2026},
   title = {vibejam},
   url = {https://github.com/erl-j/vibejam}
 }
